@@ -1,0 +1,91 @@
+name: Build & validate
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows (VST3)
+            pluginval_asset: pluginval_Windows.zip
+          - os: macos-latest
+            name: macOS (VST3 + AU)
+            pluginval_asset: pluginval_macOS.zip
+
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # JUCE is fetched via CMake FetchContent (see CMakeLists.txt) - caching
+      # build/_deps avoids re-downloading/rebuilding JUCE on every run.
+      - name: Cache JUCE (FetchContent)
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: ${{ runner.os }}-juce-8.0.4-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Locate built VST3
+        shell: bash
+        run: |
+          VST3_PATH=$(find build -iname "*.vst3" -type d | head -n 1)
+          if [ -z "$VST3_PATH" ]; then
+            echo "No .vst3 bundle found under build/" >&2
+            exit 1
+          fi
+          echo "Found: $VST3_PATH"
+          echo "VST3_PATH=$VST3_PATH" >> "$GITHUB_ENV"
+
+      - name: Download pluginval
+        shell: bash
+        run: |
+          curl -sSL -o pluginval.zip \
+            "https://github.com/Tracktion/pluginval/releases/latest/download/${{ matrix.pluginval_asset }}"
+          unzip -q pluginval.zip -d pluginval
+
+      - name: Run pluginval (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: ./pluginval/pluginval.exe --strictness-level 5 --validate "$VST3_PATH"
+
+      - name: Run pluginval (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # Strip the quarantine attribute so a freshly downloaded, unsigned
+          # pluginval binary is actually allowed to run on the CI runner.
+          xattr -cr pluginval/pluginval.app
+          chmod +x pluginval/pluginval.app/Contents/MacOS/pluginval
+          ./pluginval/pluginval.app/Contents/MacOS/pluginval --strictness-level 5 --validate "$VST3_PATH"
+
+      - name: Validate AU with auval (macOS)
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        run: |
+          # PLUGIN_MANUFACTURER_CODE / PLUGIN_CODE from CMakeLists.txt.
+          # continue-on-error: auval can be finicky about plugin registration
+          # timing on a fresh runner; the pluginval step above is the primary
+          # gate, this is a best-effort extra check.
+          auval -v aufx Ms8q Jkar
+
+      - name: Upload built plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: MSEQ8-${{ runner.os }}
+          path: ${{ env.VST3_PATH }}
+          if-no-files-found: error

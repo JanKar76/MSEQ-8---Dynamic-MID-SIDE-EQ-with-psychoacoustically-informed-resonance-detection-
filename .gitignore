@@ -1,0 +1,18 @@
+# Byggkataloger (innehåller genererade filer, ska aldrig committas)
+build/
+cmake-build-*/
+out/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# pluginval - nedladdat testverktyg, inte projektkod (stora binärer)
+pluginval.exe
+pluginval_Windows.zip
+pluginval_*.zip
