@@ -4,7 +4,7 @@ project(MSEQ8 VERSION 1.0.0)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Hämta JUCE. Alternativ: add_subdirectory(path/to/JUCE) om du har JUCE lokalt.
+# Get JUCE. Alternative: add_subdirectory(path/to/JUCE) if you have JUCE locally.
 include(FetchContent)
 FetchContent_Declare(
     JUCE
