@@ -14,8 +14,11 @@ Repository: <https://github.com/JanKar76/MSEQ-8---Dynamic-MID-SIDE-EQ-with-psych
 
 ---
 
-## Features
+<img width="1000" height="600" alt="image" src="https://github.com/user-attachments/assets/ef5ee7e6-dde9-448f-b955-bd8d85d0370c" />
 
+
+## Features
+  
 **EQ engine**
 - 8 bell bands: Freq 20 Hz–20 kHz, Gain ±18 dB, Q 0.1–10
 - Per-band Mid / Mid+Side / Side routing (M/S encode–decode inside the plugin)
