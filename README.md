@@ -14,13 +14,12 @@ Repository: <https://github.com/JanKar76/MSEQ-8---Dynamic-MID-SIDE-EQ-with-psych
 
 ---
 
-<img width="1000" height="600" alt="image" src="https://github.com/user-attachments/assets/ef5ee7e6-dde9-448f-b955-bd8d85d0370c" />
-
-
 ## Features
-  
+
 **EQ engine**
-- 8 bell bands: Freq 20 Hz–20 kHz, Gain ±18 dB, Q 0.1–10
+- 8 bands: Freq 20 Hz–20 kHz, Gain ±18 dB, Q 0.1–10, each independently switchable
+  between **Bell, Low Shelf, High Shelf and Notch** from the right-click panel
+  (Notch is gain-less — a pure surgical cut, its node locks to 0 dB)
 - Per-band Mid / Mid+Side / Side routing (M/S encode–decode inside the plugin)
 - High-pass and low-pass filters: Butterworth 12/24/48 dB per octave, each with
   its own Stereo / Mid / Side routing
@@ -32,12 +31,24 @@ Repository: <https://github.com/JanKar76/MSEQ-8---Dynamic-MID-SIDE-EQ-with-psych
   (all four adjustable from the right-click dynamics panel), band-pass
   detector with soft 12 dB knee, allocation-free coefficient updates in
   sub-blocks
+- **External sidechain input**: an optional stereo sidechain bus plus a
+  per-band `SC` toggle in the dynamics panel — lets any band's gain
+  reduction be triggered by an external signal (e.g. duck a band whenever a
+  kick drum on another track hits) instead of its own audio. Falls back
+  silently to the band's own signal if the host hasn't connected the
+  sidechain bus
 - **Ctrl+hover band audition**: hold Ctrl and hover a band to solo just that
   frequency range (bandpass isolation with crossfade), so you can hear what a
   band is sitting on before you touch it
 - **Mono-compatibility warning**: flags excessive low-frequency Side energy
   relative to Mid — a common cause of phase cancellation on mono playback
 - Output gain ±12 dB (ramped), global bypass, click-free Mid/Side solo monitoring
+- **DELTA**: listen to only what the EQ is removing/adding — computed in the
+  M/S domain before the monitor stage, so it combines with MONITOR M/S to
+  isolate the change in just the centre or just the width
+- **MATCH button**: auto-sets output gain from a ~2 s running average of
+  input vs. post-EQ loudness, so a boost or cut doesn't skew an A/B
+  comparison with perceived loudness
 - All sound-shaping parameters exposed for DAW automation, full state recall
 
 **Analysis & UI**
@@ -67,8 +78,9 @@ Repository: <https://github.com/JanKar76/MSEQ-8---Dynamic-MID-SIDE-EQ-with-psych
   ghost rings showing dynamic bands' actual gain in real time
 - Crosshair with frequency + musical note + cents, hover readouts,
   spectrum freeze for before/after comparison, zoomable dB axis
-- A/B/C/D snapshots, factory + user presets (XML), large IN/OUT meters with
-  dB scale, resizable window
+- A/B/C/D snapshots, 39 factory presets across 14 genres (browsed via a
+  genre → preset menu) + user presets (XML), large IN/OUT meters with dB
+  scale, a broadband phase correlation strip (-1..+1), resizable window
 
 Full manual: [`MSEQ8-Guide-EN.pdf`](MSEQ8-Guide-EN.pdf) (English) /
 [`MSEQ8-Guide.pdf`](MSEQ8-Guide.pdf) (Swedish).
@@ -86,7 +98,9 @@ cmake -B build
 cmake --build build --config Release
 ```
 
-- **Formats:** VST3 on all platforms, AU additionally on macOS.
+- **Formats:** VST3 on all platforms, AU additionally on macOS. macOS builds
+  are not yet code-signed/notarized by CI — a local unsigned build will need
+  Gatekeeper bypassed manually until that's set up (see [`ROADMAP.md`](ROADMAP.md)).
 - `COPY_PLUGIN_AFTER_BUILD` is enabled, so the plugin is installed to the
   system plugin folder after building (on Windows this may require running
   the build from an elevated prompt the first time).
