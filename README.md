@@ -7,6 +7,10 @@ independently. Clean up muddy bass in the stereo width without touching the kick
 add air to the sides without sharpening the lead vocal, or make any band dynamic
 so it only works when it is needed.
 
+
+<img width="1000 " height="6000" alt="MSEQ8_plugin" src="https://github.com/user-attachments/assets/eed72d4d-1058-41d4-b824-007e27557979" />
+
+
 > Licensed under **AGPL-3.0** — free to use, study, modify and redistribute.
 > See [Licensing](#licensing) for the details that apply to JUCE and VST3.
 
