@@ -34,15 +34,20 @@ Planned, reasonably well-scoped, but not yet started.
   but hasn't been verified on an actual, unmodified macOS install. Without notarization,
   Gatekeeper will likely block a freshly built binary outright — this needs to be resolved
   and tested before "Mac support" can be claimed with confidence.
-- **Match Gain button.** Deferred from the original dynamic-EQ/audition feature batch —
-  auto-compensates output level after a boost/cut so A/B comparisons aren't skewed by
-  loudness.
-- **Correlation / width meter.** The mono-compatibility warning already reuses the RES
-  detector's data; a small continuous correlation or M/S balance meter in the header is a
-  natural, low-cost extension of that same data.
-- **Sidechain input for dynamic bands.** External trigger for the per-band dynamics engine
-  — a commonly requested "real" mastering/mixing feature that builds directly on the
-  existing dynamic-EQ engine.
+
+## Recently shipped
+
+- ~~**Match Gain button.**~~ **Done.** A `MATCH` button next to the output gain knob
+  auto-sets output gain so a ~2 s running average of post-EQ loudness matches the plugin's
+  input loudness, so A/B comparisons aren't skewed by a boost/cut. See
+  `MSEQ8AudioProcessor::matchGain()`.
+- ~~**Correlation / width meter.**~~ **Done.** A small horizontal broadband phase
+  correlation strip (-1..+1) now sits under the IN/OUT level meters, computed directly from
+  the decoded L/R signal each block.
+- ~~**Sidechain input for dynamic bands.**~~ **Done.** An optional stereo sidechain input
+  bus plus a per-band `SC` toggle (in the right-click dynamics panel) lets any band's
+  detector listen to an external signal instead of its own audio, falling back silently to
+  the band's own signal if the host hasn't connected the sidechain bus.
 
 ## Later
 
@@ -50,8 +55,14 @@ Directional — worth pursuing, but scope and timing are loose.
 
 - **Linear-phase mode.** Optional latency-for-phase-accuracy tradeoff, aimed at mastering
   use where zero phase distortion matters more than latency.
-- **Searchable preset browser + more factory presets.** Genre-oriented presets and a
-  browser with search/tags once the preset list grows beyond a short dropdown.
+- ~~**Genre-oriented factory presets.**~~ **Done.** 38 new factory presets across 13
+  genres (Pop/Vocal, EDM/Electronic, Rock/Band, Hip-Hop/Trap, Acoustic/Singer-Songwriter,
+  Podcast/Voice, Mastering/Bus, R&B/Soul, Jazz/Acoustic Ensemble, Classical/Orchestral,
+  Reggae/Dub, Funk/Disco, Latin/Afrobeats, Cinematic/Film), browsed via a two-level
+  genre → preset `PopupMenu` (replacing the old flat dropdown). See
+  `MSEQ8AudioProcessor::getPresetList()`.
+- **Searchable preset browser.** Text search/tags across the (now much longer) preset
+  list, for finding a specific preset without opening every genre submenu.
 - **CLAP format support.** Modern, open plugin format — a natural fit alongside the
   project's AGPL-3.0 stance.
 - **Expanded/named snapshots.** More than four A/B/C/D slots, with names, for people who

@@ -1,5 +1,109 @@
 # MSEQ 8 — 8-band Mid/Side parametrisk EQ (JUCE, VST3/AU)
 
+## v19 — Frekvensberoende Q-tak
+
+- **Nytt: det effektiva Q-taket skalar nu med frekvens istället för ett platt
+  tak på 10.** Bandbredd ≈ frekvens/Q, så ett Q på 10 skär redan en försumbart
+  smal notch på subbas, medan samma Q knappt gör avtryck på en resonans i
+  mellan-/högregistret — att bara höja taket rakt av till 40 hade sprängt
+  dynamikmotorns attack-/release-/knäformler (som delar samma Q) vid låga
+  frekvenser utan att ge något musikaliskt värde där. Istället rampar
+  `MSEQ8AudioProcessor::maxQForFreq()` det effektiva taket från 10 under
+  150 Hz till 40 över 500 Hz (linjär rampning däremellan), tillämpat tyst
+  överallt Q faktiskt används i signalbehandlingen: filterkoefficienter,
+  dynamikdetektorn/knät, Ctrl+hover-avlyssning och Find Resonances egna
+  föreslagna Q-värden. Den råa `Q`-parameterns intervall är nu 0.1–40
+  (knoppens skew oförändrad) så det extra utrymmet nås genom att skriva in
+  ett exakt värde eller via presets/automation; grafens scroll-hjuls-steg
+  för Q respekterar samma frekvensberoende tak per nod.
+- Lyssningstestat: mindre musikaliskt material filtreras bort som
+  sidoeffekt när högre Q används för kirurgisk borttagning i
+  mellan-/högregistret.
+- **Fix: grafens Bell-/Notch-kurvor slutade bli visuellt smalare över
+  Q=10 (Notch: Q=25), trots att själva filtret fortsatte smalna korrekt.**
+  `EQGraphComponent`s `bandMagnitudeDb()` approximerar bandformen med
+  `x = oktavavstånd / max(golv, bandbredd * 0.5)`; golvet (0.05 för Bell,
+  0.02 för Notch) var harmlöst så länge Q hade ett hårt tak på platta 10
+  överallt, men när det nya frekvensberoende taket tillät Q upp till 40
+  började golvet träffas för varje Q över 10/25 och fryste tyst den
+  ritade kurvans bredd från den punkten — formen på skärmen slutade följa
+  ratten trots att ljudet fortsatte ändras under. Sänkte båda golven
+  (0.005 / 0.002) så de hamnar under den smalaste bandbredd taket nu kan
+  ge (0.0125 vid Q=40), så kurvan följer Q hela vägen upp till taket igen.
+
+## v18 — Genre-grupperade fabrikspresets, header-/rutnätspolish
+
+- **Ny: 38 nya fabrikspresets fördelade på 14 genrer**, utöver de ursprungliga 3
+  (Vocal Clarity, Wide Master, Low-End Focus — oförändrade). Genrer: Pop/Vocal,
+  EDM/Electronic, Rock/Band, Hip-Hop/Trap, Acoustic/Singer-Songwriter, Podcast/Voice,
+  Mastering/Bus, R&B/Soul, Jazz/Acoustic Ensemble, Classical/Orchestral, Reggae/Dub,
+  Funk/Disco, Latin/Afrobeats och Cinematic/Film. Varje preset är en genomtänkt
+  uppsättning band-gain/Q/mode/type och dynamikmotor-deltan från neutralt
+  standardläge (endast de tre ursprungliga fabriksfrekvenserna/-slottarna rörs
+  någonsin, aldrig `freqID`). Se `MSEQ8AudioProcessor::getPresetList()` /
+  `applyPreset()`.
+- **Ny: preset-bläddrare i två nivåer.** Den platta preset-`ComboBox`en ersätts av
+  en `TextButton` som öppnar en `PopupMenu` med en undermeny per genre (byggd från
+  `getPresetList()`s ordning), "Default" på toppnivå, sedan "User Presets" och
+  "Save preset..." längst ner — skalar bra nu när antalet presets vuxit från 4
+  till 39 (+ användarpresets).
+- **Ny: "Dialogue-Safe Mix" (Cinematic/Film) slår på sidechain som standard** på
+  band4:s dynamikdetektor (`SC`-togglingen), tänkt att kombineras med en
+  dialogstam kopplad till pluginets sidechain-input för att "duckа" musik under
+  dialog; faller tillbaka till självdetektering om inget är inkopplat, enligt
+  befintlig sidechain-fallback.
+- **Fix: `CorrelationMeter` kompilerade inte med `setTooltip()`.** Den är en ren
+  `juce::Component` och behöver `juce::SettableTooltipClient` inblandad, precis
+  som `Button`/`TextButton` redan får gratis.
+- **Ny: adaptivt dB-rutnätssteg.** EQ-grafens horisontella rutnätslinjer använder
+  nu 2 dB-avstånd vid hård inzoomning (`displayMaxDb <= 9`), 3 dB vid medelzoom
+  (`<= 15`) och 6 dB vid ursprunglig vid zoom — ersätter ett fast 6 dB-avstånd som
+  var för grovt vid inzoomning, och som tyst slutade rita linjer bortom ±12 dB
+  även när man zoomat ut längre än så.
+- **Ändring: headerns kontrollkluster (presets/A-B-C-D/monitor/delta/gain/match/
+  bypass) ankrat direkt efter "8-BAND MID/SIDE EQUALIZER"-undertexten**, uppmätt
+  via `GlyphArrangement::getStringWidthInt` i stället för en gissad fast offset,
+  för tightare användning av smala skärmar.
+
+## v17 — Match Gain, korrelationsmeter, sidechain-input för dynamikbanden
+
+- **Ny: Match Gain-knapp (MATCH, i headern bredvid GAIN-ratten).** Håller ett
+  ~2 sekunders löpande medelvärde av ingångens effekt (`avgInPower`, mätt
+  före all bearbetning) och av utgångens effekt precis före
+  output-gain-steget (`avgOutPower`, mäts direkt på det avkodade L/R-
+  paret). Ett klick sätter `output_gain` till `jlimit(-12, 12, inDb - outDb)`
+  så att A/B-jämförelser inte förvrängs av att en boost eller cut i sig
+  låter högre/lägre. Gör ingenting om det inte funnits tillräckligt med
+  signal ännu (nära tystnad på endera sidan).
+- **Ny: bredbandig fasrelationsmeter (CORR, under IN/OUT-metrarna).** Räknar
+  ut en klassisk korrelationskoefficient (`Σ(L·R) / √(Σ(L²)·Σ(R²))`) direkt
+  på det avkodade L/R-paret varje block, EMA-utjämnad över ~5 block för en
+  stabil avläsning. -1 = helt urfas (mono-inkompatibelt), 0 = brett/
+  okorrelerat, +1 = mono-kompatibelt. Billig förlängning av samma
+  ljuddata mono-varningen redan tittar på, precis som föreslaget i
+  roadmappen.
+- **Ny: externt sidechain-input för dynamikbanden.** En valfri stereo
+  sidechain-buss (`.withInput("Sidechain", ..., false)`, avstängd som
+  standard tills värden kopplar in den) plus en `SC`-togglingsknapp per band
+  i högerklicks-dynamikpanelen. När påslagen och värden faktiskt levererar
+  sidechain-ljud läser bandets detektor det externa L/R-paret (kodat till
+  mid/side på samma sätt som huvudingången) i stället för bandets egen
+  bearbetade signal — själva gain-reduktionen appliceras fortfarande alltid
+  på bandets eget ljud. Faller tyst tillbaka till bandets egen signal om
+  värden inte kopplat in sidechain-bussen. `isBusesLayoutSupported()`
+  kräver att sidechain-bussen antingen är avstängd eller stereo.
+- **Fix: `output_gain`-ramp begränsad till kanal 0/1 explicit.** Med
+  sidechain-bussen påslagen kan den delade `buffer` som `processBlock()` får
+  nu innehålla fler än 2 kanaler; `applyGainRamp` utan kanalargument
+  påverkar ALLA kanaler i buffern, vilket i onödan skulle ha rört
+  sidechain-kanalerna också. Bytt till två explicita per-kanal-anrop
+  (kanal 0 och 1).
+- **Minsta fönsterbredd höjd 1020 -> 1140.** MATCH-knappen breddade
+  headerns högerkluster med ~54px; eftersom det klustret är ankrat mot
+  fönstrets högerkant medan preset/A-B-C-D-blocket skalar från mitten,
+  gav en rak +54 till golvet noll marginal mellan dem vid minsta storlek.
+  1140 återställer den ursprungliga ~24px-marginalen.
+
 ## v16 — GitHub-städning: CI, engelska källkodskommentarer, dokumentationsfix
 
 - **Ny: GitHub Actions CI (`.github/workflows/build.yml`).** Bygger VST3 på

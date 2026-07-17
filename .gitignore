@@ -2,6 +2,8 @@
 build/
 cmake-build-*/
 out/
+Screenshoots/
+marketing-site/
 
 # IDE
 .vs/
@@ -16,3 +18,4 @@ Thumbs.db
 pluginval.exe
 pluginval_Windows.zip
 pluginval_*.zip
+compa.bat

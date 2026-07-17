@@ -50,6 +50,19 @@ namespace
         return { full.getRight() - 92, 6, 80, 20 };
     }
 
+    // Chooses a "nice" dB grid step from the current zoom level
+    // (displayMaxDb, see EQGraphComponent::mouseWheelMove()) so the
+    // horizontal grid lines stay useful at any zoom instead of a fixed 6 dB
+    // spacing - which is a coarse step once you've zoomed in far enough that
+    // 1-3 dB differences actually matter, and previously didn't even extend
+    // out to the full +/-30 dB range when zoomed out.
+    float dbGridStep (float displayMaxDb)
+    {
+        if (displayMaxDb <= 9.0f)  return 2.0f;
+        if (displayMaxDb <= 15.0f) return 3.0f;
+        return 6.0f;
+    }
+
     // A rough but visually reasonable magnitude approximation for graph
     // rendering (the actual audio engine uses real biquad coefficients in
     // PluginProcessor; this is purely for drawing the curve).
@@ -75,13 +88,23 @@ namespace
             case MSEQ8AudioProcessor::typeNotch:
             {
                 const float bw = 1.0f / juce::jmax (0.1f, q);
-                const float x  = oct / juce::jmax (0.02f, bw * 0.5f);
+                // Floor is just numerical safety (avoids a divide-by-zero if
+                // q were ever huge) - it must stay below the narrowest bw*0.5
+                // the frequency-dependent Q ceiling can produce, currently
+                // 0.0125 at q=40 (see MSEQ8AudioProcessor::maxQForFreq).
+                // 0.02 used to sit above that once the ceiling was raised
+                // past the old flat max of 10, which silently froze the
+                // curve's width for every Q above 10 - it never got a chance
+                // to trigger back when 10 was the hard ceiling everywhere.
+                const float x  = oct / juce::jmax (0.002f, bw * 0.5f);
                 return -30.0f / (1.0f + x * x);
             }
             default: // Bell
             {
                 const float bw = 1.0f / juce::jmax (0.1f, q);
-                const float x  = oct / juce::jmax (0.05f, bw * 0.5f);
+                // Same fix as the notch case above (0.05 used to freeze the
+                // visual width at the old Q=10 shape for anything higher).
+                const float x  = oct / juce::jmax (0.005f, bw * 0.5f);
                 return gainDb / (1.0f + x * x);
             }
         }
@@ -113,6 +136,24 @@ namespace
                 typeButtons[i].setLookAndFeel (&lnf);
                 addAndMakeVisible (typeButtons[i]);
             }
+
+            // External sidechain toggle (see MSEQ8AudioProcessor::scID()):
+            // when on and the host has actually connected a stereo
+            // sidechain input, this band's detector listens to that
+            // external signal instead of the band's own audio - lets one
+            // band's gain reduction be triggered by e.g. a kick drum
+            // elsewhere. Silently falls back to the band's own signal if no
+            // sidechain is connected (see PluginProcessor::processBlock()).
+            scButton.setClickingTogglesState (true);
+            scButton.setColour (juce::TextButton::buttonColourId, Theme::panelLight);
+            scButton.setColour (juce::TextButton::buttonOnColourId, Theme::side);
+            scButton.setColour (juce::TextButton::textColourOffId, Theme::textDim);
+            scButton.setColour (juce::TextButton::textColourOnId, Theme::background);
+            scButton.setTooltip ("Trigger this band's dynamics from an external sidechain input");
+            scButton.setLookAndFeel (&lnf);
+            addAndMakeVisible (scButton);
+            scAtt = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (
+                processor.apvts, MSEQ8AudioProcessor::scID (bandIndex), scButton);
 
             // NoTextBox + the value drawn manually in paint() (label above,
             // value below) - EXACTLY the same pattern as BandColumn's
@@ -160,6 +201,7 @@ namespace
             rangeSlider.setLookAndFeel  (nullptr);
             attSlider.setLookAndFeel    (nullptr);
             relSlider.setLookAndFeel    (nullptr);
+            scButton.setLookAndFeel (nullptr);
             for (auto& b : typeButtons)
                 b.setLookAndFeel (nullptr);
         }
@@ -170,7 +212,9 @@ namespace
 
             g.setColour (Theme::text);
             g.setFont (juce::Font (juce::FontOptions (13.0f, juce::Font::bold)));
-            g.drawText (title, 12, 8, getWidth() - 24, 20, juce::Justification::left);
+            // Width trimmed to leave room for the SC toggle button in the
+            // top-right corner (see resized()).
+            g.drawText (title, 12, 8, getWidth() - 64, 20, juce::Justification::left);
 
             // The label row's and value row's y must match the reserved gaps
             // in resized() exactly (8 inset + 26 title + 24 type row + 6 gap
@@ -202,6 +246,8 @@ namespace
 
         void resized() override
         {
+            scButton.setBounds (getWidth() - 48, 6, 40, 18);
+
             auto r = getLocalBounds().reduced (8);
             r.removeFromTop (26);
 
@@ -245,8 +291,10 @@ namespace
         const juce::String title;
 
         juce::TextButton typeButtons[4];
+        juce::TextButton scButton { "SC" };
         juce::Slider threshSlider, rangeSlider, attSlider, relSlider;
         std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> threshAtt, rangeAtt, attAtt, relAtt;
+        std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> scAtt;
 
         KnobLookAndFeel lnf;
     };
@@ -848,16 +896,24 @@ void EQGraphComponent::drawGrid (juce::Graphics& g) const
 {
     const auto area = plotArea (getLocalBounds().toFloat());
 
-    const float dbLines[] = { 12.0f, 6.0f, 0.0f, -6.0f, -12.0f };
-    for (float db : dbLines)
+    // See dbGridStep(): step shrinks as displayMaxDb shrinks (zooming in),
+    // and the loop now covers the full +/-displayMaxDb range instead of a
+    // fixed set of lines that could leave the outer part of the range bare
+    // when zoomed out.
+    const float step = dbGridStep (displayMaxDb);
+    for (float db = 0.0f; db <= displayMaxDb + 0.01f; db += step)
     {
-        if (db > displayMaxDb || db < -displayMaxDb)
-            continue;
-
         const float y = gainToY (db);
         g.setColour (db == 0.0f ? Theme::outline.brighter (0.15f).withAlpha (0.6f)
                                  : Theme::outline.withAlpha (0.3f));
         g.drawHorizontalLine ((int) y, area.getX(), area.getRight());
+
+        if (db > 0.0f)
+        {
+            const float yNeg = gainToY (-db);
+            g.setColour (Theme::outline.withAlpha (0.3f));
+            g.drawHorizontalLine ((int) yNeg, area.getX(), area.getRight());
+        }
     }
 
     const float freqs[] = { 50.0f, 100.0f, 200.0f, 500.0f, 1000.0f, 2000.0f, 5000.0f, 10000.0f };
@@ -871,16 +927,22 @@ void EQGraphComponent::drawAxisLabels (juce::Graphics& g) const
     const auto area = plotArea (getLocalBounds().toFloat());
     g.setFont (juce::Font (juce::FontOptions (10.0f)));
 
-    const float dbLines[] = { 12.0f, 6.0f, 0.0f, -6.0f, -12.0f };
-    for (float db : dbLines)
+    // Matches drawGrid()'s zoom-adaptive step (see dbGridStep()) so labels
+    // always line up with the grid lines actually drawn.
+    auto drawDbLabel = [&] (float db)
     {
-        if (db > displayMaxDb || db < -displayMaxDb)
-            continue;
-
         const float y = gainToY (db);
         g.setColour (Theme::textDim.withAlpha (0.7f));
         g.drawText ((db > 0.0f ? "+" : "") + juce::String ((int) db),
                     4, (int) y - 6, (int) area.getX() - 6, 12, juce::Justification::right);
+    };
+
+    const float step = dbGridStep (displayMaxDb);
+    for (float db = 0.0f; db <= displayMaxDb + 0.01f; db += step)
+    {
+        drawDbLabel (db);
+        if (db > 0.0f)
+            drawDbLabel (-db);
     }
 
     const float freqs[] = { 50.0f, 100.0f, 200.0f, 500.0f, 1000.0f, 2000.0f, 5000.0f, 10000.0f };
@@ -1278,7 +1340,11 @@ void EQGraphComponent::drawAuditionMarkers (juce::Graphics& g) const
         return;
 
     const float freq = processor.apvts.getRawParameterValue (MSEQ8AudioProcessor::freqID (hoveredNode))->load();
-    const float q     = juce::jmax (0.5f, processor.apvts.getRawParameterValue (MSEQ8AudioProcessor::qID (hoveredNode))->load());
+    // Capped the same way as the actual audition bandpass filter
+    // (PluginProcessor::processBlock) - these markers show the real
+    // auditioned width, not the uncapped parameter value.
+    const float q     = juce::jmin (juce::jmax (0.5f, processor.apvts.getRawParameterValue (MSEQ8AudioProcessor::qID (hoveredNode))->load()),
+                                    MSEQ8AudioProcessor::maxQForFreq (freq));
 
     // Same rough bandwidth approximation (bw ~= freq/Q) that Find
     // Resonances' Q measurement uses in reverse in buildProposals() -
@@ -1348,7 +1414,14 @@ void EQGraphComponent::buildCurve (juce::Path& p, bool sideChannel) const
 
             const int type = (int) processor.apvts.getRawParameterValue (MSEQ8AudioProcessor::typeID (b))->load();
             const float f0 = processor.apvts.getRawParameterValue (MSEQ8AudioProcessor::freqID (b))->load();
-            const float q  = processor.apvts.getRawParameterValue (MSEQ8AudioProcessor::qID (b))->load();
+            // Same frequency-dependent Q ceiling as the actual filter (see
+            // MSEQ8AudioProcessor::maxQForFreq) - otherwise the curve would
+            // keep drawing narrower above the effective cap while the real
+            // audio silently stays at the capped width, which is exactly
+            // the mismatch that made it look like nothing happened past 10
+            // on a low-frequency band.
+            const float q  = juce::jmin (processor.apvts.getRawParameterValue (MSEQ8AudioProcessor::qID (b))->load(),
+                                         MSEQ8AudioProcessor::maxQForFreq (f0));
             const float gainDb = sideChannel ? processor.dynGainSide[b].load() : processor.dynGainMid[b].load();
 
             totalDb += bandMagnitudeDb (type, freq, f0, q, gainDb);
@@ -1845,7 +1918,8 @@ void EQGraphComponent::mouseWheelMove (const juce::MouseEvent& e, const juce::Mo
         if (auto* pq = processor.apvts.getParameter (MSEQ8AudioProcessor::qID (node)))
         {
             const float currentQ = pq->convertFrom0to1 (pq->getValue());
-            const float newQ = juce::jlimit (0.1f, 10.0f, currentQ + wheel.deltaY * 2.0f);
+            const float nodeFreq = processor.apvts.getRawParameterValue (MSEQ8AudioProcessor::freqID (node))->load();
+            const float newQ = juce::jlimit (0.1f, MSEQ8AudioProcessor::maxQForFreq (nodeFreq), currentQ + wheel.deltaY * 2.0f);
             pq->setValueNotifyingHost (pq->convertTo0to1 (newQ));
             repaint();
         }
@@ -1970,7 +2044,7 @@ void EQGraphComponent::buildProposals()
             const float fHi = pointFreq ((float) rp);
             const float fC  = pointFreq ((float) p);
             const float bw  = juce::jmax (1.0f, fHi - fLo);
-            const float q   = juce::jlimit (2.0f, 10.0f, fC / bw);   // matches the band's real Q range (0.1-10)
+            const float q   = juce::jlimit (2.0f, MSEQ8AudioProcessor::maxQForFreq (fC), fC / bw);   // matches the band's effective (frequency-dependent) Q ceiling
 
             peaks.push_back ({ p, fC, excess, c, q, side, lp, rp });
         }

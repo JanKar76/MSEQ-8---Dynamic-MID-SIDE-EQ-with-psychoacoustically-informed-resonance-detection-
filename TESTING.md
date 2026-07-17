@@ -31,6 +31,8 @@ hosts).
 | Automating dyn threshold/range | The ghost ring reacts correctly |
 | A/B/C/D + save/reload project | Exact recall of every parameter + window size |
 | User preset: save, restart DAW, load preset | Preset persists and loads correctly |
+| Open preset menu, pick a preset from each genre submenu | Correct submenu grouping, correct params applied, button label updates |
+| Load "Dialogue-Safe Mix" with/without sidechain connected | SC toggle on band4 is on; ducks external sidechain if connected, self-detects otherwise |
 | Resize mid-playback | No audio glitches, rendering pauses/resumes cleanly |
 | Delta + MONITOR M/S combined | Hearing delta of the correct channel |
 | Find Resonances mid-playback, APPLY, UNDO | Proposals are reasonable, UNDO restores exactly |
@@ -43,6 +45,11 @@ hosts).
 | Independent Mid/Side HP/LP | Two nodes appear, each with its own frequency/slope |
 | Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y | Undo/redo up to 5 steps, across parameters, Find Resonances, and presets |
 | Multiple instances (3+), unfocused windows | Host stays responsive; no audible glitches from the render throttle |
+| MATCH button after a large boost/cut | Output gain jumps to compensate within ~2 s; A/B against BYPASS sounds level-matched |
+| MATCH with near-silent input | No action (button is a no-op, doesn't snap gain to something extreme) |
+| CORR meter: mono material, then hard-panned/inverted-phase material | Reads near +1 for mono, swings toward -1 for out-of-phase content |
+| Sidechain: enable the host's sidechain routing, toggle SC on a band | That band's gain reduction follows the sidechain source, not its own audio |
+| Sidechain: SC toggled on but host has no sidechain routed | Band behaves exactly as if SC were off (silent fallback, no crash/glitch) |
 
 ## 3. CPU check
 
@@ -61,6 +68,10 @@ hosts).
   render in/out and null them against each other (phase-inverted) — the
   residual should sit below roughly -120 dBFS.
 - Static +18 dB boost, Q 10, sweep the freq knob fast: no zipper clicks.
+- Set a band to ~2 kHz and type Q 40 via double-click: sweep the freq knob
+  down toward sub-bass and back up — the effective Q should audibly relax
+  (ceiling ramps 40 → 10 between 500 Hz and 150 Hz) without clicks or a
+  sudden jump.
 - Dynamic band with extreme range (-18): the pumping should be smooth, no
   clicks.
 - HP 48 dB/oct at 30 Hz on bass-heavy material: no instability/DC drift.

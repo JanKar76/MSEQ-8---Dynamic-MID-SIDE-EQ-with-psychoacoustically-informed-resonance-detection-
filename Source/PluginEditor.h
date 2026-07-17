@@ -304,7 +304,46 @@ private:
 };
 
 //==============================================================================
-/** Large in/out meter panel with a dB scale, placed to the right of the graph. */
+/** Small horizontal broadband phase correlation meter (-1..+1), fed by
+    MSEQ8AudioProcessor::correlation (polled once per editor timer tick).
+    -1 = out of phase/mono-incompatible, 0 = wide/uncorrelated stereo image,
+    +1 = mono-compatible. A cheap, always-visible companion to the mono-
+    compatibility text warning already shown on the graph. */
+class CorrelationMeter : public juce::Component,
+                         public juce::SettableTooltipClient
+{
+public:
+    void setValue (float newValue)
+    {
+        value = juce::jlimit (-1.0f, 1.0f, newValue);
+        repaint();
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        auto r = getLocalBounds().toFloat();
+        g.setColour (Theme::panelLight);
+        g.fillRoundedRectangle (r, 2.0f);
+
+        const float mid = r.getX() + r.getWidth() * 0.5f;
+        g.setColour (Theme::outline);
+        g.drawVerticalLine (juce::roundToInt (mid), r.getY(), r.getBottom());
+
+        const float w = (value * 0.5f) * r.getWidth();
+        auto fill = juce::Rectangle<float> (juce::jmin (mid, mid + w), r.getY(),
+                                            std::abs (w), r.getHeight());
+        g.setColour (value < -0.3f ? Theme::side : Theme::meterFill);
+        g.fillRoundedRectangle (fill, 2.0f);
+    }
+
+private:
+    float value = 1.0f;
+};
+
+//==============================================================================
+/** Large in/out meter panel with a dB scale, placed to the right of the graph.
+    Also hosts a small correlation strip at the bottom (see CorrelationMeter
+    above) - a cheap, always-on companion to the level meters. */
 class MeterPanel : public juce::Component
 {
 public:
@@ -312,9 +351,12 @@ public:
     {
         addAndMakeVisible (inMeter);
         addAndMakeVisible (outMeter);
+        corrMeter.setTooltip ("Broadband phase correlation: -1 = out of phase, +1 = mono-compatible");
+        addAndMakeVisible (corrMeter);
     }
 
     LevelMeter inMeter, outMeter;
+    CorrelationMeter corrMeter;
 
     void paint (juce::Graphics& g) override
     {
@@ -335,6 +377,15 @@ public:
             g.setColour (Theme::textDim);
             g.drawText (juce::String (db), 54, y - 6, 28, 12, juce::Justification::left);
         }
+
+        // Correlation strip: -1/+1 range labels bound the bar directly
+        // below, which is sized to match the combined IN+OUT meter width
+        // (x=2..42) rather than the full panel - keeps it visually aligned
+        // with the meters above it instead of stretching into the dB-scale
+        // number column to the right.
+        g.setFont (juce::Font (juce::FontOptions (9.0f)));
+        g.drawText ("-1", 2,  getHeight() - 24, 20, 12, juce::Justification::left);
+        g.drawText ("+1", 22, getHeight() - 24, 20, 12, juce::Justification::right);
     }
 
     void resized() override
@@ -342,12 +393,15 @@ public:
         const auto area = meterArea();
         inMeter.setBounds  (2,  area.getY(), 16, area.getHeight());
         outMeter.setBounds (26, area.getY(), 16, area.getHeight());
+        corrMeter.setBounds (2, getHeight() - 12, 40, 8);
     }
 
 private:
     juce::Rectangle<int> meterArea() const
     {
-        return getLocalBounds().withTrimmedTop (18).withTrimmedBottom (4);
+        // Bottom trimmed further than before (4 -> 28) to make room for the
+        // correlation strip's label + bar.
+        return getLocalBounds().withTrimmedTop (18).withTrimmedBottom (28);
     }
 };
 
@@ -366,7 +420,7 @@ public:
 private:
     void timerCallback() override;
     void updateSlotButtons();
-    void rebuildPresetBox();
+    void showPresetMenu();
     void promptSavePreset();
 
     // Undo/redo debounce: see processor.paramChangeGeneration. Polled here
@@ -379,6 +433,15 @@ private:
     static constexpr int userPresetBaseId = 100;
     static constexpr int savePresetItemId = 999;
 
+    // x position of the header control cluster (preset -> A/B/C/D ->
+    // monitor -> delta -> gain -> match -> bypass), measured in resized()
+    // from the actual width of the "8-BAND MID/SIDE EQUALIZER" subtitle
+    // text rather than a guessed fixed offset - so the cluster always
+    // starts right after it regardless of the OS's font substitution.
+    // Cached here (instead of remeasuring every paint()) since paint() also
+    // needs it for the MONITOR/DELTA/GAIN labels above those controls.
+    int headerClusterX = 340;
+
     MSEQ8AudioProcessor& processor;
 
     KnobLookAndFeel knobLnf;
@@ -386,7 +449,7 @@ private:
     EQGraphComponent graph;
     juce::OwnedArray<BandColumn> bandColumns;
 
-    juce::ComboBox presetBox;
+    juce::TextButton presetButton;
     juce::Array<juce::File> userPresetFiles;
     int lastPresetId = 1;
 
@@ -402,6 +465,10 @@ private:
 
     ValueEntryKnob outGainKnob;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> outGainAtt;
+
+    // Match Gain: one-shot action (not a parameter), sets output_gain so
+    // pre/post-EQ loudness match - see MSEQ8AudioProcessor::matchGain().
+    juce::TextButton matchGainButton { "MATCH" };
 
     MeterPanel meterPanel;
 

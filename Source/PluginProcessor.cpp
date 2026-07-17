@@ -77,10 +77,23 @@ namespace
     }
 }
 
+// See declaration in PluginProcessor.h for the full rationale. Flat 10 below
+// 150 Hz, flat 40 above 500 Hz, linear ramp between.
+float MSEQ8AudioProcessor::maxQForFreq (float freqHz)
+{
+    return juce::jmap (juce::jlimit (150.0f, 500.0f, freqHz), 150.0f, 500.0f, 10.0f, 40.0f);
+}
+
 MSEQ8AudioProcessor::MSEQ8AudioProcessor()
     : AudioProcessor (BusesProperties()
                         .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
-                        .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+                        .withOutput ("Output", juce::AudioChannelSet::stereo(), true)
+                        // Optional stereo sidechain input for the per-band
+                        // "SC" toggle (see scID() and processBlock()).
+                        // Disabled by default (false) - most hosts require
+                        // the user to explicitly enable it in their routing
+                        // matrix, same as any sidechain-capable plugin.
+                        .withInput  ("Sidechain", juce::AudioChannelSet::stereo(), false)),
       apvts (*this, nullptr, "PARAMS", createParameterLayout())
 {
     for (int i = 0; i < numBands; ++i)
@@ -95,6 +108,7 @@ MSEQ8AudioProcessor::MSEQ8AudioProcessor()
         pDynAtt[i]     = apvts.getRawParameterValue (dynAttID (i));
         pDynRel[i]     = apvts.getRawParameterValue (dynRelID (i));
         pType[i]       = apvts.getRawParameterValue (typeID (i));
+        pScOn[i]       = apvts.getRawParameterValue (scID (i));
     }
     pGlobalBypass = apvts.getRawParameterValue ("global_bypass");
 
@@ -186,7 +200,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout MSEQ8AudioProcessor::createP
 
         layout.add (std::make_unique<AudioParameterFloat> (
             ParameterID { qID (i), 1 }, "Band " + num + " Q",
-            NormalisableRange<float> (0.1f, 10.0f, 0.01f, 0.35f),
+            NormalisableRange<float> (0.1f, 40.0f, 0.01f, 0.35f),
             1.0f));
 
         layout.add (std::make_unique<AudioParameterChoice> (
@@ -219,6 +233,9 @@ juce::AudioProcessorValueTreeState::ParameterLayout MSEQ8AudioProcessor::createP
             ParameterID { dynRelID (i), 1 }, "Band " + num + " Dyn Release",
             NormalisableRange<float> (20.0f, 1000.0f, 1.0f, 0.4f), 150.0f,
             AudioParameterFloatAttributes().withLabel ("ms")));
+
+        layout.add (std::make_unique<AudioParameterBool> (
+            ParameterID { scID (i), 1 }, "Band " + num + " Sidechain", false));
     }
 
     // HP/LP
@@ -341,6 +358,11 @@ void MSEQ8AudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     sideBuffer.setSize (1, samplesPerBlock);
     dryMidBuffer.setSize  (1, samplesPerBlock);
     drySideBuffer.setSize (1, samplesPerBlock);
+    scMidBuffer.setSize  (1, samplesPerBlock);
+    scSideBuffer.setSize (1, samplesPerBlock);
+    sidechainActive = false;
+    avgInPower.store (0.0f);
+    avgOutPower.store (0.0f);
 
     // Delta crossfade ~10 ms
     smDelta.reset (sampleRate, 0.01);
@@ -377,8 +399,22 @@ void MSEQ8AudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 bool MSEQ8AudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 {
     // M/S requires stereo in/out
-    return layouts.getMainInputChannelSet()  == juce::AudioChannelSet::stereo()
-        && layouts.getMainOutputChannelSet() == juce::AudioChannelSet::stereo();
+    if (layouts.getMainInputChannelSet()  != juce::AudioChannelSet::stereo()
+        || layouts.getMainOutputChannelSet() != juce::AudioChannelSet::stereo())
+        return false;
+
+    // Optional sidechain input bus (see the constructor and the per-band
+    // "SC" toggle): must be either fully disabled or stereo. Anything else
+    // (e.g. a host offering a mono sidechain) is rejected so processBlock()
+    // never has to guess how to fold an odd channel count into mid/side.
+    if (layouts.inputBuses.size() > 1)
+    {
+        const auto sc = layouts.getChannelSet (true, 1);
+        if (! sc.isDisabled() && sc != juce::AudioChannelSet::stereo())
+            return false;
+    }
+
+    return true;
 }
 
 //==============================================================================
@@ -401,10 +437,14 @@ void MSEQ8AudioProcessor::updateFilters()
 
         const float f = pFreq[i]->load();
         const float g = pGain[i]->load();
-        const float q = pQ[i]->load();
         const int type = (int) pType[i]->load();
         const float range = pDynRange[i]->load();
         const float freq = juce::jlimit (20.0f, (float) (currentSampleRate * 0.49), f);
+        // Frequency-dependent Q ceiling (see maxQForFreq): the filter,
+        // detector and dynamics-engine knee/attack/release all read this
+        // same capped value, so one clamp here keeps every downstream
+        // consumer musically sane without touching the raw parameter range.
+        const float q = juce::jmin (pQ[i]->load(), maxQForFreq (freq));
 
         if (coeffsDirty)
         {
@@ -604,6 +644,11 @@ void MSEQ8AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
                                  + buffer.getRMSLevel (1, 0, numSamples));
         inLevel.store (juce::jmax (peak, inLevel.load() * 0.85f));
         inRms.store (rms);
+
+        // Slow (~2 s) running average of input power, used by matchGain()
+        // to estimate the plugin's overall input loudness.
+        const float alpha = 1.0f - std::exp (-(float) numSamples / (float) (currentSampleRate * 2.0));
+        avgInPower.store (avgInPower.load() + (rms * rms - avgInPower.load()) * alpha);
     }
 
     if (pGlobalBypass->load() > 0.5f)
@@ -646,6 +691,34 @@ void MSEQ8AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         drySide[n] = side[n];
     }
 
+    // Optional external sidechain (see scID() and the per-band "SC" toggle
+    // in the dynamics panel): encoded to mid/side exactly like the main
+    // input. sidechainActive silently falls back to false - and every
+    // band's detector falls back to its own signal - if the host hasn't
+    // connected/enabled the sidechain bus (getBusBuffer() then returns a
+    // buffer with 0 channels).
+    sidechainActive = false;
+    if (getBusCount (true) > 1)
+    {
+        auto scBuffer = getBusBuffer (buffer, true, 1);
+        if (scBuffer.getNumChannels() >= 2)
+        {
+            scMidBuffer.setSize  (1, numSamples, false, false, true);
+            scSideBuffer.setSize (1, numSamples, false, false, true);
+            auto* scMid  = scMidBuffer.getWritePointer (0);
+            auto* scSide = scSideBuffer.getWritePointer (0);
+            const auto* scL = scBuffer.getReadPointer (0);
+            const auto* scR = scBuffer.getReadPointer (1);
+
+            for (int n = 0; n < numSamples; ++n)
+            {
+                scMid[n]  = (scL[n] + scR[n]) * 0.5f;
+                scSide[n] = (scL[n] - scR[n]) * 0.5f;
+            }
+            sidechainActive = true;
+        }
+    }
+
     // Peak bands per M/S mode (static or dynamic per band)
     for (int i = 0; i < numBands; ++i)
     {
@@ -653,12 +726,15 @@ void MSEQ8AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
             continue;
 
         const int mode = (int) pMode[i]->load();
+        const bool useSc = sidechainActive && pScOn[i]->load() > 0.5f;
 
         if (mode == modeMid || mode == modeMidSide)
-            processBandChannel (i, mid, numSamples, false);
+            processBandChannel (i, mid, numSamples, false,
+                                useSc ? scMidBuffer.getReadPointer (0) : nullptr);
 
         if (mode == modeSide || mode == modeMidSide)
-            processBandChannel (i, side, numSamples, true);
+            processBandChannel (i, side, numSamples, true,
+                                useSc ? scSideBuffer.getReadPointer (0) : nullptr);
     }
 
     // HP/LP with Stereo/Mid/Side routing
@@ -754,6 +830,31 @@ void MSEQ8AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         }
     }
 
+    // Broadband L/R phase correlation (-1 = out of phase, 0 = wide/
+    // uncorrelated, +1 = mono-compatible), plus a slow running average of
+    // output power (pre output-gain, for matchGain()). Both computed
+    // directly from the just-decoded L/R signal - cheap O(numSamples)
+    // passes that reuse the buffer already in hand at this point.
+    {
+        float sumLR = 0.0f, sumLL = 0.0f, sumRR = 0.0f;
+        for (int n = 0; n < numSamples; ++n)
+        {
+            sumLR += left[n] * right[n];
+            sumLL += left[n] * left[n];
+            sumRR += right[n] * right[n];
+        }
+
+        if (sumLL > 1.0e-9f && sumRR > 1.0e-9f)
+        {
+            const float corr = juce::jlimit (-1.0f, 1.0f, sumLR / std::sqrt (sumLL * sumRR));
+            correlation.store (correlation.load() + (corr - correlation.load()) * 0.2f);
+        }
+
+        const float outPower = 0.5f * (sumLL + sumRR) / (float) numSamples;
+        const float alpha = 1.0f - std::exp (-(float) numSamples / (float) (currentSampleRate * 2.0));
+        avgOutPower.store (avgOutPower.load() + (outPower - avgOutPower.load()) * alpha);
+    }
+
     // Ctrl+hover audition: isolates a band's approximate frequency range
     // (a bandpass around its freq/Q) in the final L/R signal, so the user
     // can hear just that band playing. Affects monitoring only, not the
@@ -766,7 +867,7 @@ void MSEQ8AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         if (wantAudition)
         {
             const float freq = juce::jlimit (20.0f, (float) (currentSampleRate * 0.49), pFreq[ab]->load());
-            const float q    = juce::jmax (0.5f, pQ[ab]->load());
+            const float q    = juce::jmin (juce::jmax (0.5f, pQ[ab]->load()), maxQForFreq (freq));
 
             if (ab != lastAuditionBand || freq != lastAuditionFreq || q != lastAuditionQ)
             {
@@ -798,9 +899,13 @@ void MSEQ8AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         }
     }
 
-    // Output gain, ramped for click-free automation
+    // Output gain, ramped for click-free automation. Applied per-channel to
+    // channels 0/1 explicitly (not the all-channels overload) - with the
+    // optional sidechain bus enabled, `buffer` can now carry more than 2
+    // channels, and only the main stereo output (0/1) should be trimmed.
     const float targetGain = juce::Decibels::decibelsToGain (pOutGain->load());
-    buffer.applyGainRamp (0, numSamples, lastOutGain, targetGain);
+    buffer.applyGainRamp (0, 0, numSamples, lastOutGain, targetGain);
+    buffer.applyGainRamp (1, 0, numSamples, lastOutGain, targetGain);
     lastOutGain = targetGain;
 
     // Out-meter
@@ -816,7 +921,7 @@ void MSEQ8AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
 
 //==============================================================================
 void MSEQ8AudioProcessor::processBandChannel (int band, float* data, int numSamples,
-                                              bool sideChannel)
+                                              bool sideChannel, const float* extDet)
 {
     const int ch   = sideChannel ? 1 : 0;
     auto& filter   = sideChannel ? sideFilters[band]      : midFilters[band];
@@ -868,7 +973,12 @@ void MSEQ8AudioProcessor::processBandChannel (int band, float* data, int numSamp
 
             for (int n = start; n < start + len; ++n)
             {
-                const float x = std::abs (detector.processSample (data[n]));
+                // extDet, when supplied, is the "SC"-toggled external
+                // sidechain signal (see processBlock()) - the detector then
+                // measures that instead of the band's own audio, while the
+                // gain reduction it computes still always applies to data[].
+                const float src = extDet != nullptr ? extDet[n] : data[n];
+                const float x = std::abs (detector.processSample (src));
                 env = x > env ? att * env + (1.0f - att) * x
                               : rel * env + (1.0f - rel) * x;
             }
@@ -1003,6 +1113,25 @@ void MSEQ8AudioProcessor::redo()
 }
 
 //==============================================================================
+void MSEQ8AudioProcessor::matchGain()
+{
+    const float inPow  = avgInPower.load();
+    const float outPow = avgOutPower.load();
+
+    // Not enough signal yet to make a meaningful measurement - do nothing
+    // rather than snap the output gain to a nonsensical value from silence.
+    if (inPow < 1.0e-9f || outPow < 1.0e-9f)
+        return;
+
+    const float inDb  = juce::Decibels::gainToDecibels (std::sqrt (inPow),  -100.0f);
+    const float outDb = juce::Decibels::gainToDecibels (std::sqrt (outPow), -100.0f);
+    const float target = juce::jlimit (-12.0f, 12.0f, inDb - outDb);
+
+    if (auto* p = apvts.getParameter ("output_gain"))
+        p->setValueNotifyingHost (p->convertTo0to1 (target));
+}
+
+//==============================================================================
 void MSEQ8AudioProcessor::storeCurrentSlot()
 {
     snapshots[activeSlot] = apvts.copyState().createCopy();
@@ -1070,9 +1199,72 @@ void MSEQ8AudioProcessor::loadUserPreset (const juce::File& file)
 }
 
 //==============================================================================
+const std::vector<MSEQ8AudioProcessor::PresetInfo>& MSEQ8AudioProcessor::getPresetList()
+{
+    static const std::vector<PresetInfo> list = {
+        { "", "Default" },
+
+        { "Pop / Vocal", "Vocal Clarity" },
+        { "Pop / Vocal", "Pop Bright" },
+        { "Pop / Vocal", "Wide Chorus" },
+        { "Pop / Vocal", "Modern Pop Polish" },
+
+        { "EDM / Electronic", "Wide Master" },
+        { "EDM / Electronic", "Punchy Low End" },
+        { "EDM / Electronic", "Airy Top" },
+        { "EDM / Electronic", "House/Techno Groove" },
+        { "EDM / Electronic", "Drum & Bass Sub Focus" },
+
+        { "Rock / Band", "Rock Punch" },
+        { "Rock / Band", "Wide Guitars" },
+        { "Rock / Band", "Metal Scoop" },
+
+        { "Hip-Hop / Trap", "Bass Focus" },
+        { "Hip-Hop / Trap", "Vocal Cut-Through" },
+        { "Hip-Hop / Trap", "Lo-fi Chillhop" },
+
+        { "Acoustic / Singer-Songwriter", "Warm Acoustic" },
+        { "Acoustic / Singer-Songwriter", "Intimate" },
+        { "Acoustic / Singer-Songwriter", "Country/Americana Twang" },
+
+        { "Podcast / Voice", "Podcast Voice" },
+        { "Podcast / Voice", "Broadcast/Streaming Safe" },
+
+        { "Mastering / Bus", "Low-End Focus" },
+        { "Mastering / Bus", "Mix Bus Glue" },
+        { "Mastering / Bus", "Mono Bass Safety" },
+        { "Mastering / Bus", "Vinyl Mastering" },
+
+        { "R&B / Soul", "Silky Vocal" },
+        { "R&B / Soul", "Neo-Soul Warmth" },
+
+        { "Jazz / Acoustic Ensemble", "Natural Ensemble" },
+        { "Jazz / Acoustic Ensemble", "Live Room Wide" },
+
+        { "Classical / Orchestral", "Transparent Master" },
+        { "Classical / Orchestral", "Dynamic Range Preserve" },
+
+        { "Reggae / Dub", "Deep Sub Dub" },
+        { "Reggae / Dub", "Skank Brightness" },
+
+        { "Funk / Disco", "Punchy Bassline" },
+        { "Funk / Disco", "Wide Rhythm Section" },
+
+        { "Latin / Afrobeats", "Percussion Forward" },
+        { "Latin / Afrobeats", "Warm Groove" },
+
+        { "Cinematic / Film", "Big Wide Score" },
+        { "Cinematic / Film", "Dialogue-Safe Mix" },
+    };
+    return list;
+}
+
 juce::StringArray MSEQ8AudioProcessor::getPresetNames() const
 {
-    return { "Default", "Vocal Clarity", "Wide Master", "Low-End Focus" };
+    juce::StringArray names;
+    for (auto& p : getPresetList())
+        names.add (p.name);
+    return names;
 }
 
 void MSEQ8AudioProcessor::applyPreset (int index)
@@ -1096,6 +1288,7 @@ void MSEQ8AudioProcessor::applyPreset (int index)
         setParam (dynRangeID (i),  0.0f);
         setParam (dynAttID (i),    5.0f);
         setParam (dynRelID (i),    150.0f);
+        setParam (scID (i),        0.0f);
     }
     setParam ("hp_on", 0.0f);  setParam ("hp_freq", 30.0f);
     setParam ("hp_slope", 0.0f);  setParam ("hp_mode", (float) cutStereo);
@@ -1110,6 +1303,8 @@ void MSEQ8AudioProcessor::applyPreset (int index)
 
     switch (index)
     {
+        //=========================================================
+        // Pop / Vocal
         case 1: // Vocal Clarity
             setParam ("hp_on", 1.0f);  setParam ("hp_freq", 80.0f);
             setParam (gainID (1), -1.5f);  setParam (qID (1), 1.1f);
@@ -1121,7 +1316,35 @@ void MSEQ8AudioProcessor::applyPreset (int index)
             setParam (gainID (7), 1.5f);   setParam (modeID (7), (float) modeSide);
             break;
 
-        case 2: // Wide Master
+        case 2: // Pop Bright
+            setParam ("hp_on", 1.0f);  setParam ("hp_freq", 70.0f);
+            setParam (gainID (3), 1.0f);   setParam (qID (3), 1.0f);  setParam (modeID (3), (float) modeMid);
+            setParam (gainID (5), 2.5f);   setParam (qID (5), 0.9f);
+            setParam (dynRangeID (5), -2.0f);  setParam (dynThreshID (5), -18.0f);
+            setParam (dynAttID (5), 3.0f);     setParam (dynRelID (5), 120.0f);
+            setParam (gainID (6), 1.5f);
+            setParam (gainID (7), 1.5f);
+            break;
+
+        case 3: // Wide Chorus
+            setParam (gainID (5), 1.5f);   setParam (modeID (5), (float) modeSide);
+            setParam (gainID (6), 2.0f);   setParam (modeID (6), (float) modeSide);
+            setParam (gainID (7), 1.0f);   setParam (modeID (7), (float) modeSide);
+            break;
+
+        case 4: // Modern Pop Polish
+            setParam ("hp_on", 1.0f);  setParam ("hp_freq", 60.0f);
+            setParam (dynRangeID (3), -2.5f);  setParam (dynThreshID (3), -16.0f);
+            setParam (dynAttID (3), 2.0f);     setParam (dynRelID (3), 100.0f);
+            setParam (gainID (5), 3.0f);   setParam (qID (5), 0.8f);
+            setParam (dynRangeID (5), -2.0f);  setParam (dynThreshID (5), -14.0f);
+            setParam (dynAttID (5), 2.0f);     setParam (dynRelID (5), 90.0f);
+            setParam (gainID (7), 2.0f);   setParam (modeID (7), (float) modeSide);
+            break;
+
+        //=========================================================
+        // EDM / Electronic
+        case 5: // Wide Master
             setParam ("hp_on", 1.0f);  setParam ("hp_freq", 120.0f);
             setParam ("hp_mode", (float) cutSide);
             setParam (gainID (5), 1.5f);   setParam (modeID (5), (float) modeSide);
@@ -1129,10 +1352,242 @@ void MSEQ8AudioProcessor::applyPreset (int index)
             setParam (gainID (7), 2.5f);   setParam (modeID (7), (float) modeSide);
             break;
 
-        case 3: // Low-End Focus
+        case 6: // Punchy Low End
+            setParam (gainID (0), 2.0f);   setParam (modeID (0), (float) modeMid);
+            setParam (gainID (1), -1.0f);  setParam (modeID (1), (float) modeMid);
+            setParam (dynRangeID (1), -3.0f);  setParam (dynThreshID (1), -20.0f);
+            setParam (dynAttID (1), 8.0f);     setParam (dynRelID (1), 150.0f);
+            setParam (gainID (2), -1.5f);  setParam (modeID (2), (float) modeMid);
+            break;
+
+        case 7: // Airy Top
+            setParam (gainID (2), -1.0f);
+            setParam (gainID (6), 2.0f);   setParam (modeID (6), (float) modeSide);
+            setParam (gainID (7), 3.0f);   setParam (qID (7), 0.8f);  setParam (modeID (7), (float) modeSide);
+            break;
+
+        case 8: // House/Techno Groove
+            setParam ("hp_on", 1.0f);  setParam ("hp_freq", 40.0f);  setParam ("hp_mode", (float) cutSide);
+            setParam (modeID (0), (float) modeMid);  setParam (gainID (0), 1.5f);
+            setParam (dynRangeID (6), -2.0f);  setParam (dynThreshID (6), -20.0f);
+            setParam (dynAttID (6), 5.0f);     setParam (dynRelID (6), 100.0f);
+            setParam (modeID (6), (float) modeSide);
+            break;
+
+        case 9: // Drum & Bass Sub Focus
+            setParam (gainID (0), 3.0f);   setParam (qID (0), 1.3f);  setParam (modeID (0), (float) modeMid);
+            setParam (dynRangeID (0), -4.0f);  setParam (dynThreshID (0), -12.0f);
+            setParam (dynAttID (0), 2.0f);     setParam (dynRelID (0), 60.0f);
+            setParam (gainID (1), -1.5f);  setParam (modeID (1), (float) modeMid);
+            setParam ("hp_on", 1.0f);  setParam ("hp_freq", 30.0f);  setParam ("hp_slope", 1.0f);
+            break;
+
+        //=========================================================
+        // Rock / Band
+        case 10: // Rock Punch
+            setParam (dynRangeID (2), -3.0f);  setParam (dynThreshID (2), -18.0f);
+            setParam (dynAttID (2), 10.0f);    setParam (dynRelID (2), 180.0f);
+            setParam (modeID (2), (float) modeMid);
+            setParam (gainID (5), 2.0f);   setParam (qID (5), 1.0f);
+            break;
+
+        case 11: // Wide Guitars
+            setParam (gainID (4), 1.5f);   setParam (modeID (4), (float) modeSide);
+            setParam (gainID (5), 1.5f);   setParam (modeID (5), (float) modeSide);
+            setParam (gainID (3), -1.0f);  setParam (modeID (3), (float) modeMid);
+            break;
+
+        case 12: // Metal Scoop
+            setParam (gainID (3), -3.0f);  setParam (qID (3), 0.9f);
+            setParam (dynRangeID (6), -2.5f);  setParam (dynThreshID (6), -14.0f);
+            setParam (dynAttID (6), 2.0f);     setParam (dynRelID (6), 80.0f);
+            setParam (gainID (0), 1.5f);   setParam (modeID (0), (float) modeMid);
+            break;
+
+        //=========================================================
+        // Hip-Hop / Trap
+        case 13: // Bass Focus
+            setParam (gainID (0), 3.0f);   setParam (modeID (0), (float) modeMid);
+            setParam (dynRangeID (0), -3.0f);  setParam (dynThreshID (0), -14.0f);
+            setParam (dynAttID (0), 5.0f);     setParam (dynRelID (0), 120.0f);
+            setParam (gainID (2), -1.5f);  setParam (modeID (2), (float) modeMid);
+            break;
+
+        case 14: // Vocal Cut-Through
+            setParam ("hp_on", 1.0f);  setParam ("hp_freq", 90.0f);
+            setParam (gainID (4), 2.0f);
+            setParam (gainID (5), 2.5f);
+            setParam (dynRangeID (5), -2.0f);  setParam (dynThreshID (5), -16.0f);
+            setParam (dynAttID (5), 3.0f);     setParam (dynRelID (5), 100.0f);
+            break;
+
+        case 15: // Lo-fi Chillhop
+            setParam (gainID (6), -3.0f);
+            setParam (gainID (7), -4.0f);
+            setParam (gainID (2), 1.0f);
+            setParam (modeID (5), (float) modeSide);  setParam (gainID (5), -2.0f);
+            break;
+
+        //=========================================================
+        // Acoustic / Singer-Songwriter
+        case 16: // Warm Acoustic
+            setParam (dynRangeID (2), -2.0f);  setParam (dynThreshID (2), -20.0f);
+            setParam (dynAttID (2), 15.0f);    setParam (dynRelID (2), 200.0f);
+            setParam (gainID (1), 1.0f);
+            break;
+
+        case 17: // Intimate
+            setParam (gainID (5), -1.0f);  setParam (modeID (5), (float) modeSide);
+            setParam (gainID (6), -1.0f);  setParam (modeID (6), (float) modeSide);
+            setParam (gainID (4), 1.5f);   setParam (modeID (4), (float) modeMid);
+            break;
+
+        case 18: // Country/Americana Twang
+            setParam (gainID (5), 2.0f);   setParam (qID (5), 1.1f);
+            setParam (gainID (1), 0.5f);
+            setParam (gainID (3), -1.0f);
+            break;
+
+        //=========================================================
+        // Podcast / Voice
+        case 19: // Podcast Voice
+            setParam ("hp_on", 1.0f);  setParam ("hp_freq", 100.0f);
+            setParam (gainID (2), -1.5f);
+            setParam (gainID (4), 1.5f);
+            setParam (gainID (5), 1.5f);
+            setParam (dynRangeID (5), -2.0f);  setParam (dynThreshID (5), -18.0f);
+            setParam (dynAttID (5), 3.0f);     setParam (dynRelID (5), 90.0f);
+            break;
+
+        case 20: // Broadcast/Streaming Safe
+            setParam ("hp_on", 1.0f);  setParam ("hp_freq", 60.0f);  setParam ("hp_mode", (float) cutSide);
+            setParam ("hp_independent", 1.0f);  setParam ("hp_side_freq", 120.0f);
+            setParam (dynRangeID (5), -2.5f);  setParam (dynThreshID (5), -16.0f);
+            setParam (dynAttID (5), 3.0f);     setParam (dynRelID (5), 100.0f);
+            break;
+
+        //=========================================================
+        // Mastering / Bus
+        case 21: // Low-End Focus
             setParam (gainID (0), 2.5f);   setParam (modeID (0), (float) modeMid);
             setParam (gainID (1), 1.5f);   setParam (modeID (1), (float) modeMid);
             setParam (gainID (2), -1.0f);
+            break;
+
+        case 22: // Mix Bus Glue
+            setParam (gainID (3), -0.5f);
+            setParam (gainID (5), 0.5f);
+            break;
+
+        case 23: // Mono Bass Safety
+            setParam ("hp_independent", 1.0f);
+            setParam ("hp_on", 1.0f);  setParam ("hp_freq", 30.0f);  setParam ("hp_side_freq", 120.0f);
+            setParam ("hp_slope", 1.0f);  setParam ("hp_side_slope", 1.0f);
+            break;
+
+        case 24: // Vinyl Mastering
+            setParam ("hp_independent", 1.0f);
+            setParam ("hp_on", 1.0f);  setParam ("hp_freq", 25.0f);  setParam ("hp_side_freq", 150.0f);
+            setParam ("hp_slope", 1.0f);  setParam ("hp_side_slope", 2.0f);
+            setParam (gainID (7), -1.5f);
+            setParam ("lp_on", 1.0f);  setParam ("lp_freq", 18000.0f);
+            break;
+
+        //=========================================================
+        // R&B / Soul
+        case 25: // Silky Vocal
+            setParam (gainID (2), -1.0f);
+            setParam (gainID (4), 1.0f);
+            setParam (gainID (6), 1.5f);
+            setParam (dynRangeID (6), -2.0f);  setParam (dynThreshID (6), -16.0f);
+            setParam (dynAttID (6), 3.0f);     setParam (dynRelID (6), 100.0f);
+            setParam (gainID (1), 0.5f);
+            break;
+
+        case 26: // Neo-Soul Warmth
+            setParam (gainID (1), 1.5f);   setParam (modeID (1), (float) modeMid);
+            setParam (gainID (4), 1.0f);   setParam (modeID (4), (float) modeSide);
+            setParam (gainID (6), -1.0f);
+            break;
+
+        //=========================================================
+        // Jazz / Acoustic Ensemble
+        case 27: // Natural Ensemble
+            setParam (dynRangeID (3), -1.5f);  setParam (dynThreshID (3), -22.0f);
+            setParam (dynAttID (3), 20.0f);    setParam (dynRelID (3), 250.0f);
+            setParam (gainID (6), -0.5f);
+            break;
+
+        case 28: // Live Room Wide
+            setParam (gainID (4), 1.0f);   setParam (modeID (4), (float) modeSide);
+            setParam (gainID (6), 1.0f);   setParam (modeID (6), (float) modeSide);
+            break;
+
+        //=========================================================
+        // Classical / Orchestral
+        case 29: // Transparent Master
+            setParam (gainID (5), 0.3f);
+            setParam (gainID (7), 0.5f);   setParam (modeID (7), (float) modeSide);
+            break;
+
+        case 30: // Dynamic Range Preserve
+            setParam (dynRangeID (5), -1.0f);  setParam (dynThreshID (5), -8.0f);
+            setParam (dynAttID (5), 30.0f);    setParam (dynRelID (5), 400.0f);
+            break;
+
+        //=========================================================
+        // Reggae / Dub
+        case 31: // Deep Sub Dub
+            setParam (gainID (0), 3.0f);   setParam (modeID (0), (float) modeMid);
+            setParam (gainID (1), 1.0f);   setParam (modeID (1), (float) modeMid);
+            setParam (gainID (5), 1.0f);   setParam (modeID (5), (float) modeSide);
+            setParam (gainID (7), 1.5f);   setParam (modeID (7), (float) modeSide);
+            break;
+
+        case 32: // Skank Brightness
+            setParam (gainID (4), 1.5f);
+            setParam (gainID (0), 1.0f);   setParam (modeID (0), (float) modeMid);
+            break;
+
+        //=========================================================
+        // Funk / Disco
+        case 33: // Punchy Bassline
+            setParam (gainID (1), 2.0f);   setParam (modeID (1), (float) modeMid);
+            setParam (dynRangeID (1), -2.5f);  setParam (dynThreshID (1), -16.0f);
+            setParam (dynAttID (1), 5.0f);     setParam (dynRelID (1), 120.0f);
+            setParam (gainID (2), -1.0f);  setParam (modeID (2), (float) modeMid);
+            break;
+
+        case 34: // Wide Rhythm Section
+            setParam (gainID (5), 1.5f);   setParam (modeID (5), (float) modeSide);
+            setParam (gainID (6), 2.0f);   setParam (modeID (6), (float) modeSide);
+            break;
+
+        //=========================================================
+        // Latin / Afrobeats
+        case 35: // Percussion Forward
+            setParam (gainID (5), 2.0f);   setParam (modeID (5), (float) modeSide);
+            setParam (gainID (6), 1.5f);   setParam (modeID (6), (float) modeSide);
+            break;
+
+        case 36: // Warm Groove
+            setParam (gainID (1), 1.5f);
+            setParam (dynRangeID (2), -1.5f);  setParam (dynThreshID (2), -20.0f);
+            setParam (dynAttID (2), 15.0f);    setParam (dynRelID (2), 200.0f);
+            break;
+
+        //=========================================================
+        // Cinematic / Film
+        case 37: // Big Wide Score
+            setParam (gainID (4), 1.0f);   setParam (modeID (4), (float) modeSide);
+            setParam (gainID (6), 1.5f);   setParam (modeID (6), (float) modeSide);
+            setParam (gainID (0), 1.5f);   setParam (modeID (0), (float) modeMid);
+            break;
+
+        case 38: // Dialogue-Safe Mix
+            setParam (dynRangeID (4), -3.0f);  setParam (dynThreshID (4), -20.0f);
+            setParam (dynAttID (4), 10.0f);    setParam (dynRelID (4), 200.0f);
+            setParam (scID (4), 1.0f);
             break;
 
         default:

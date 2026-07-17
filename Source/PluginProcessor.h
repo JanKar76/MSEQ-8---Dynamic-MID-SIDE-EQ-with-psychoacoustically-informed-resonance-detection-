@@ -65,12 +65,31 @@ public:
     static juce::String bypassID (int band)  { return "band" + juce::String (band) + "_bypass"; }
     static juce::String typeID   (int band)  { return "band" + juce::String (band) + "_type"; }
 
+    // Effective Q ceiling for a given band frequency. Bandwidth ~= freq/Q,
+    // so a high Q buys almost nothing extra at low (sub-bass) frequencies
+    // but is musically useful in the mid/high range - and the dynamics
+    // engine's knee/attack/release formulas share this same Q value, so an
+    // unconditionally raised ceiling would blow past their sensible limits
+    // at low frequencies. Ramps 10 -> 40 between 150 Hz and 500 Hz; flat 10
+    // below, flat 40 above. Applied silently wherever Q is read for actual
+    // processing (filter coefficients, detector, dynamics, audition,
+    // Find Resonances) - the raw parameter range and on-screen knob are a
+    // separate, later concern.
+    static float maxQForFreq (float freqHz);
+
     // Dynamic EQ per band: threshold (dB), range (dB, 0 = static band),
     // attack and release (ms) for the envelope detector
     static juce::String dynThreshID (int band) { return "band" + juce::String (band) + "_dyn_thresh"; }
     static juce::String dynRangeID  (int band) { return "band" + juce::String (band) + "_dyn_range"; }
     static juce::String dynAttID    (int band) { return "band" + juce::String (band) + "_dyn_att"; }
     static juce::String dynRelID    (int band) { return "band" + juce::String (band) + "_dyn_rel"; }
+
+    // Per-band external sidechain toggle: when on (and a stereo sidechain
+    // bus is actually connected by the host), the band's dynamics detector
+    // listens to the external input instead of the band's own processed
+    // signal - lets one band's gain reduction be triggered by e.g. a kick
+    // drum on another track. See processBandChannel()/processBlock().
+    static juce::String scID (int band) { return "band" + juce::String (band) + "_sc"; }
 
     // HP/LP: "hp_on", "hp_freq", "hp_slope" (12/24/48), "hp_mode" (Stereo/Mid/Side); same for "lp_*"
 
@@ -82,6 +101,13 @@ public:
     std::atomic<float> outLevel { 0.0f };
     std::atomic<float> inRms  { 0.0f };
     std::atomic<float> outRms { 0.0f };
+
+    // Broadband L/R phase correlation of the decoded output (-1 = out of
+    // phase/mono-incompatible, 0 = wide/uncorrelated, +1 = mono-compatible),
+    // ~5-block EMA-smoothed for a stable readout. Cheap extension of the
+    // signal the mono-compatibility warning already looks at - see
+    // processBlock() and EQGraphComponent's CorrelationMeter.
+    std::atomic<float> correlation { 1.0f };
 
     double getCurrentSampleRate() const noexcept { return currentSampleRate; }
 
@@ -178,6 +204,15 @@ public:
     bool canRedo() const noexcept { return undoIndex >= 0 && undoIndex < (int) undoHistory.size() - 1; }
 
     //==============================================================================
+    /** One-shot action (bound to the MATCH GAIN button in the editor): sets
+        output_gain so the ~2 s running average of post-EQ loudness matches
+        the plugin's input loudness, so A/B comparisons aren't skewed by a
+        boost/cut. Does nothing if there hasn't been enough signal yet to
+        measure (near-silence on either side). See avgInPower/avgOutPower
+        below, updated every block in processBlock(). */
+    void matchGain();
+
+    //==============================================================================
     // A/B/C/D snapshots
     static constexpr int numSlots = 4;
     void storeCurrentSlot();
@@ -185,8 +220,14 @@ public:
     int  getActiveSlot() const noexcept { return activeSlot; }
 
     //==============================================================================
-    // Factory presets
-    juce::StringArray getPresetNames() const;
+    // Factory presets: genre-grouped (see the editor's preset menu, which
+    // builds one PopupMenu submenu per distinct genre in list order).
+    // "Default" carries an empty genre and sits outside any submenu.
+    // applyPreset(index) indexes into the SAME list/order as getPresetList()
+    // - see the .cpp for both.
+    struct PresetInfo { juce::String genre; juce::String name; };
+    static const std::vector<PresetInfo>& getPresetList();
+    juce::StringArray getPresetNames() const;   // names only, derived from getPresetList()
     void applyPreset (int index);
 
     // User presets (XML files in the user's appdata folder)
@@ -212,8 +253,12 @@ private:
     /** Processes one band's filter on one channel, with dynamics if range != 0.
         The dynamics measure the level in the band's frequency range (a
         bandpass detector), compute the effective gain per sub-block, and
-        update the coefficients allocation-free. */
-    void processBandChannel (int band, float* data, int numSamples, bool sideChannel);
+        update the coefficients allocation-free. If extDet is non-null, the
+        detector reads its envelope input from there (an external sidechain
+        signal, same length as data) instead of from data itself - the
+        actual filtering still always applies to data. */
+    void processBandChannel (int band, float* data, int numSamples, bool sideChannel,
+                             const float* extDet = nullptr);
 
     // One mono filter per band, for mid and side respectively
     juce::dsp::IIR::Filter<float> midFilters[numBands];
@@ -270,6 +315,7 @@ private:
     std::atomic<float>* pDynRel[numBands] {};
     std::atomic<float>* pType[numBands] {};
     int lastType[numBands] {};
+    std::atomic<float>* pScOn[numBands] {};
     std::atomic<float>* pGlobalBypass = nullptr;
     std::atomic<float>* pHpOn = nullptr, *pHpFreq = nullptr, *pHpSlope = nullptr, *pHpMode = nullptr;
     std::atomic<float>* pHpIndependent = nullptr, *pHpSideFreq = nullptr, *pHpSideSlope = nullptr;
@@ -301,6 +347,18 @@ private:
 
     juce::AudioBuffer<float> midBuffer, sideBuffer;
     double currentSampleRate = 44100.0;
+
+    // Optional external sidechain (see scID() above and the "SC" toggle in
+    // the dynamics panel): encoded to mid/side exactly like the main input.
+    // sidechainActive is recomputed every block from the actual bus state,
+    // so a band's SC toggle silently falls back to its own signal if the
+    // host hasn't connected/enabled the sidechain bus.
+    juce::AudioBuffer<float> scMidBuffer, scSideBuffer;
+    bool sidechainActive = false;
+
+    // Match Gain (see matchGain() above): ~2 s running average of input and
+    // (pre output-gain) output power, updated every block in processBlock().
+    std::atomic<float> avgInPower { 0.0f }, avgOutPower { 0.0f };
 
     // A/B/C/D
     juce::ValueTree snapshots[numSlots];

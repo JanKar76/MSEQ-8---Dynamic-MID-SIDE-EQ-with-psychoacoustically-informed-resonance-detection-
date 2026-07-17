@@ -35,8 +35,17 @@ jobs:
           path: build/_deps
           key: ${{ runner.os }}-juce-8.0.4-${{ hashFiles('CMakeLists.txt') }}
 
+      # -DCMAKE_VS_GLOBALS=TrackFileAccess=false works around a Windows
+      # MAX_PATH (260 char) failure in MSBuild's FileTracker component
+      # (FTK1011: "could not create the new file tracking log file").
+      # actions/checkout puts the repo under D:\a\<repo>\<repo>\... - this
+      # repo's long name plus CMake's nested CMakeFiles/CMakeScratch/
+      # TryCompile-xxxx/*.tlog paths exceed 260 chars. File-access tracking
+      # is only needed for incremental builds, which CI never does (every
+      # run is a fresh checkout), so disabling it is safe here. No effect on
+      # non-Visual Studio generators (macOS), the flag is simply unused.
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_VS_GLOBALS="TrackFileAccess=false"
 
       - name: Build
         run: cmake --build build --config Release --parallel
