@@ -9,8 +9,7 @@ JUCE 8, licensed AGPL-3.0.
 This is the plugin's first tagged release on GitHub, after 18 rounds of
 iteration during development — this note summarizes the full feature set as
 it stands today, not just the latest changes (see
-[`CHANGELOG.md`](CHANGELOG.md) / [`CHANGELOG.sv.md`](CHANGELOG.sv.md) for
-the complete version-by-version history).
+[`CHANGELOG.md`](CHANGELOG.md) for the complete version-by-version history).
 
 ## Highlights
 
@@ -71,8 +70,7 @@ the complete version-by-version history).
 - User guide: [`MSEQ8-Guide-EN.pdf`](MSEQ8-Guide-EN.pdf) /
   [`MSEQ8-Guide.pdf`](MSEQ8-Guide.pdf) (Swedish), now illustrated with
   interface screenshots.
-- Full development history: [`CHANGELOG.md`](CHANGELOG.md) /
-  [`CHANGELOG.sv.md`](CHANGELOG.sv.md).
+- Full development history: [`CHANGELOG.md`](CHANGELOG.md).
 - Manual test checklist: [`TESTING.md`](TESTING.md).
 - Planned direction: [`ROADMAP.md`](ROADMAP.md) — linear-phase mode,
   searchable preset browser, CLAP support, and expanded snapshots are next.

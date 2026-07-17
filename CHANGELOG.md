@@ -1,9 +1,5 @@
 # MSEQ 8 — 8-band Mid/Side parametric EQ (JUCE, VST3/AU)
 
-> English translation of the development changelog. The original, more
-> frequently updated Swedish version lives in
-> [`CHANGELOG.sv.md`](CHANGELOG.sv.md); this file is kept in sync with it.
-
 ## v19 — Frequency-dependent Q ceiling
 
 - **New: effective Q ceiling now scales with frequency instead of being a
